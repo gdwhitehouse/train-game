@@ -73,8 +73,11 @@ const PIECES = {
   // piece.set picks which branch is switched on (0 or 1).
   points:     [[S, N], [S, E]],
   pointsLeft: [[S, N], [S, W]],
+  // Station: a straight with a platform and building on the East side
+  station:    [[N, S]],
 };
-const TRAY = ['straight', 'curve', 'cross', 'points', 'pointsLeft'];
+const TRAY = ['straight', 'curve', 'cross', 'station', 'points', 'pointsLeft'];
+const STATION_WAIT = 3; // seconds the train waits at a station
 
 // Lever position (in the unrotated unit cell) and which way the curve goes
 const POINTS = {
@@ -306,7 +309,7 @@ function startTrain(dir) {
     const [a, b] = connectionsOf(p.type, p.rot)[0];
     start = { c: p.c, r: p.r, a, b, t: 0.5 };
   }
-  train = Object.assign(start, { speed: 0, target: 0, chuff: 0, beat: 0 });
+  train = Object.assign(start, { speed: 0, target: 0, chuff: 0, beat: 0, dwell: 0, leaving: null });
 }
 
 // The drive buttons: 1 = forward, 0 = stop, -1 = backwards.
@@ -314,6 +317,13 @@ function drive(target) {
   if (!train) {
     if (target === 0 || !order.length) { sfx.toot(); return; }
     startTrain(target);
+  }
+  // Waiting at a station: forward or backwards sets off straight away, stop stays put
+  if (train.dwell > 0) {
+    train.dwell = 0;
+    train.target = target;
+    if (target !== 0) sfx.toot();
+    return;
   }
   if (target === train.target) return;
   if (target === 0) sfx.hiss();
@@ -377,8 +387,8 @@ function updateTrain(dt) {
   }
   train.jolt = Math.max(0, (train.jolt || 0) - dt * 3);
 
-  // Ease the speed towards what the buttons ask for
-  const want = train.target * SPEED;
+  // Ease the speed towards what the buttons ask for (and what the stations ask for)
+  const want = stationSpeed(dt);
   const dv = ACCEL * dt;
   train.speed += Math.max(-dv, Math.min(dv, want - train.speed));
   if (Math.abs(train.speed) < 0.001) return;
@@ -405,6 +415,39 @@ function updateTrain(dt) {
     const e = carPose(train);
     puff(e.x + Math.cos(e.a) * lay.cell * 0.1, e.y + Math.sin(e.a) * lay.cell * 0.1, 1);
   }
+}
+
+// Stations: the train brakes so its middle carriage stops alongside the platform,
+// rings the bell, waits, then carries on the way it was going. Returns the speed
+// the train should be heading for this frame.
+function stationSpeed(dt) {
+  if (train.dwell > 0) {
+    train.dwell -= dt;
+    if (train.dwell <= 0) sfx.toot(); // all aboard: off we go
+    return train.dwell > 0 ? 0 : train.target * SPEED;
+  }
+  const want = train.target * SPEED;
+  const mid = clonePos(train);
+  travel(mid, -GAP);
+  const key = mid.c + ',' + mid.r;
+  // Once the middle carriage is off the station it just left, it can stop at it again
+  if (train.leaving && train.leaving !== key) train.leaving = null;
+  const sp = pieceAt(mid.c, mid.r);
+  if (!sp || sp.type !== 'station' || train.target === 0 || train.leaving === key) return want;
+
+  // Distance from the middle carriage to the platform's middle, in the direction of travel
+  const dist = train.target > 0 ? 0.5 - mid.t : mid.t - 0.5;
+  if (dist < -0.05) return want;                 // already past the middle: don't stop
+  if (dist <= 0.01) {                            // arrived
+    train.speed = 0;
+    train.dwell = STATION_WAIT;
+    train.leaving = key;
+    sfx.bell();
+    return 0;
+  }
+  // Brake smoothly so we come to rest right at the middle
+  const brake = Math.max(0.12, Math.sqrt(2 * ACCEL * dist));
+  return train.target * Math.min(SPEED, brake);
 }
 
 // Screen position and heading of a car whose centre is at track position `pos`.
@@ -520,6 +563,14 @@ const sfx = {
   // two-note whistle: whoo-whoo!
   // stopping: a soft hiss of steam
   hiss() { if (!this.ok()) return; noise(0.7, 4000, 0.7, 0.25); },
+  // station bell: ding-ding
+  bell() {
+    if (!this.ok()) return;
+    for (const d of [0, 0.32]) {
+      tone('sine', 1320, 1300, 0.8, 0.25, d);
+      tone('sine', 2640, 2600, 0.4, 0.08, d);
+    }
+  },
   // hitting the buffers at the end of the track
   bump() { if (!this.ok()) return; tone('sine', 140, 55, 0.25, 0.6); noise(0.08, 500, 1.5, 0.5); },
   toot(delay = 0) {
@@ -690,6 +741,7 @@ function drawPiece(g, type, rot, x, y, size, spin = 0, scale = 1, alpha = 1, set
     drawLever(g, lever, POINTS[type]);
   } else {
     strokePaths(g, conns, TRACK_LAYERS);
+    if (type === 'station') drawStation(g);
   }
   g.restore();
   g.restore();
@@ -707,6 +759,34 @@ function drawPointsArrow(g, [a, b]) {
   g.closePath();
   g.fill();
   g.restore();
+}
+
+// Station platform and building, alongside the East side of the track (seen from above)
+function drawStation(g) {
+  // stone platform with a yellow safety line along the edge
+  g.fillStyle = 'rgba(0,0,0,0.2)'; rr(g, 0.775, 0.05, 0.22, 0.94, 0.04); g.fill();
+  g.fillStyle = '#cfd8dc';         rr(g, 0.765, 0.03, 0.22, 0.94, 0.04); g.fill();
+  g.fillStyle = '#ffd54f';         g.fillRect(0.775, 0.05, 0.022, 0.9);
+  // building: a red pitched roof with a ridge down the middle
+  g.fillStyle = 'rgba(0,0,0,0.25)'; rr(g, 0.825, 0.3, 0.17, 0.44, 0.03); g.fill();
+  g.fillStyle = '#e53935';          rr(g, 0.81, 0.28, 0.17, 0.44, 0.03); g.fill();
+  g.fillStyle = '#c62828';          rr(g, 0.895, 0.28, 0.085, 0.44, 0.03); g.fill();
+  g.fillStyle = '#8e1c1c';          g.fillRect(0.89, 0.29, 0.012, 0.42);
+  // clock on a post
+  g.fillStyle = '#5d4037';  circle(g, 0.88, 0.15, 0.06); g.fill();
+  g.fillStyle = '#fff';     circle(g, 0.88, 0.15, 0.045); g.fill();
+  g.strokeStyle = '#333';
+  g.lineWidth = 0.01;
+  g.lineCap = 'round';
+  g.beginPath();
+  g.moveTo(0.88, 0.15); g.lineTo(0.88, 0.12);
+  g.moveTo(0.88, 0.15); g.lineTo(0.905, 0.15);
+  g.stroke();
+  // flower tub
+  g.fillStyle = '#795548'; circle(g, 0.88, 0.85, 0.06); g.fill();
+  for (const [fx, fy, fc] of [[0.86, 0.83, '#ec407a'], [0.9, 0.84, '#fdd835'], [0.88, 0.875, '#ab47bc']]) {
+    g.fillStyle = fc; circle(g, fx, fy, 0.025); g.fill();
+  }
 }
 
 // Points lever: a red ball on a stick that leans towards the switched-on branch
