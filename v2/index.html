@@ -77,7 +77,8 @@ const PIECES = {
   station:    [[N, S]],
 };
 const TRAY = ['straight', 'curve', 'cross', 'station', 'points', 'pointsLeft'];
-const STATION_WAIT = 3; // seconds the train waits at a station
+const DOCK_AHEAD = 1.5;  // press stop this far before a station (cells) and the train still gets there
+const DOCK_BEHIND = 0.8; // ...or this far past it, and it glides back
 
 // Lever position (in the unrotated unit cell) and which way the curve goes
 const POINTS = {
@@ -310,7 +311,7 @@ function startTrain(dir) {
     const [a, b] = connectionsOf(p.type, p.rot)[0];
     start = { c: p.c, r: p.r, a, b, t: 0.5 };
   }
-  train = Object.assign(start, { speed: 0, target: 0, chuff: 0, beat: 0, dwell: 0, leaving: null,
+  train = Object.assign(start, { speed: 0, target: 0, chuff: 0, beat: 0, dwell: 0, dock: null, cued: null,
                                 riders: new Array(SEATS).fill(null) });
 }
 
@@ -320,13 +321,23 @@ function drive(target) {
     if (target === 0 || !order.length) { sfx.toot(); return; }
     startTrain(target);
   }
-  // Waiting at a station: forward or backwards sets off straight away, stop stays put
+  // At a station with people still hopping: forward or backwards sets off straight away
   if (train.dwell > 0) {
+    if (target === 0) return;
     train.dwell = 0;
-    train.target = target;
-    if (target !== 0) sfx.toot();
-    return;
+    finishHops();
   }
+  // Stop pressed near a station: glide to the platform (forwards, or back if a bit late)
+  if (target === 0) {
+    const st = nearbyStation();
+    if (st) {
+      train.dock = st.key;
+      train.target = 0;
+      sfx.hiss();
+      return;
+    }
+  }
+  train.dock = null;
   if (target === train.target) return;
   if (target === 0) sfx.hiss();
   else if (train.target === 0) sfx.toot();
@@ -337,6 +348,7 @@ function drive(target) {
 function bump() {
   train.speed = 0;
   train.target = 0;
+  train.dock = null;
   train.jolt = 1;
   sfx.bump();
   sfx.toot(0.25);
@@ -420,37 +432,75 @@ function updateTrain(dt) {
   }
 }
 
-// Stations: the train brakes so its middle carriage stops alongside the platform,
-// rings the bell, waits, then carries on the way it was going. Returns the speed
-// the train should be heading for this frame.
-function stationSpeed(dt) {
-  if (train.dwell > 0) {
-    train.dwell -= dt;
-    if (train.dwell <= 0) sfx.toot(); // all aboard: off we go
-    return train.dwell > 0 ? 0 : train.target * SPEED;
-  }
-  const want = train.target * SPEED;
+// Stations (driver mode): the train doesn't stop by itself. As it gets near a
+// station the bell rings and the people wave; if he presses stop close enough,
+// the train glides so its middle carriage stops alongside the platform.
+
+// Track position of the middle carriage (the one that lines up with the platform).
+function midCar() {
   const mid = clonePos(train);
   travel(mid, -GAP);
-  const key = mid.c + ',' + mid.r;
-  // Once the middle carriage is off the station it just left, it can stop at it again
-  if (train.leaving && train.leaving !== key) train.leaving = null;
-  const sp = pieceAt(mid.c, mid.r);
-  if (!sp || sp.type !== 'station' || train.target === 0 || train.leaving === key) return want;
+  return mid;
+}
 
-  // Distance from the middle carriage to the platform's middle, in the direction of travel
-  const dist = train.target > 0 ? 0.5 - mid.t : mid.t - 0.5;
-  if (dist < -0.05) return want;                 // already past the middle: don't stop
-  if (dist <= 0.01) {                            // arrived
-    train.speed = 0;
-    train.dwell = Math.max(STATION_WAIT, stationArrive(sp));
-    train.leaving = key;
-    sfx.bell();
+// Look along the track from `from` (dir 1 = the way the engine faces, -1 = behind)
+// for the middle of a station platform within `max` cells. Optionally only `key`.
+function findStationAlong(from, dir, max, key) {
+  for (let d = 0; d <= max; d += 0.05) {
+    const p = clonePos(from);
+    if (travel(p, dir * d) > 0) return null;          // track ends
+    const st = pieceAt(p.c, p.r);
+    const k = p.c + ',' + p.r;
+    if (st && st.type === 'station' && (!key || key === k)) {
+      const rem = dir > 0 ? 0.5 - p.t : p.t - 0.5;   // still to go to the middle
+      if (rem >= -0.001) return { st, key: k, dist: d + Math.max(0, rem) };
+    }
+  }
+  return null;
+}
+
+// The station to glide to when stop is pressed, if one is near enough.
+function nearbyStation() {
+  const mid = midCar();
+  const moving = Math.sign(train.speed) || train.target;
+  const ahead = moving || 1;
+  const a = findStationAlong(mid, ahead, moving ? DOCK_AHEAD : DOCK_BEHIND);
+  const b = findStationAlong(mid, -ahead, DOCK_BEHIND);
+  if (a && b) return a.dist <= b.dist ? a : b;
+  return a || b;
+}
+
+// Returns the speed the train should be heading for this frame.
+function stationSpeed(dt) {
+  // Stopped at a platform while people hop on and off
+  if (train.dwell > 0) {
+    train.dwell -= dt;
+    if (train.dwell <= 0) sfx.ready(); // everyone's aboard: ready when you are
     return 0;
   }
-  // Brake smoothly so we come to rest right at the middle
-  const brake = Math.max(0.12, Math.sqrt(2 * ACCEL * dist));
-  return train.target * Math.min(SPEED, brake);
+  // Gliding to a platform after stop was pressed
+  if (train.dock) {
+    const mid = midCar();
+    const a = findStationAlong(mid, 1, 3, train.dock), b = findStationAlong(mid, -1, 3, train.dock);
+    if (!a && !b) { train.dock = null; return 0; }    // station was taken away
+    const d = a && (!b || a.dist <= b.dist) ? a.dist : -b.dist;
+    if (Math.abs(d) <= 0.01) {                        // arrived
+      train.speed = 0;
+      train.dwell = stationArrive(pieceAt(...train.dock.split(',').map(Number)));
+      train.dock = null;
+      sfx.bell();
+      return 0;
+    }
+    const v = Math.max(0.12, Math.min(SPEED * 0.7, Math.sqrt(2 * ACCEL * Math.abs(d))));
+    return Math.sign(d) * v;
+  }
+  // Coming up to a station: ring the bell and get the people waving
+  if (Math.abs(train.speed) > 0.05) {
+    const s = findStationAlong(midCar(), Math.sign(train.speed), 1.6);
+    if (s && train.cued !== s.key) { train.cued = s.key; s.st.excited = 3; sfx.bell(); }
+    if (!s) train.cued = null;
+  }
+  return train.target * SPEED;
 }
 
 // Screen position and heading of a car whose centre is at track position `pos`.
@@ -474,9 +524,37 @@ const SKIN_COLOURS = ['#f8d5b5', '#e0ac69', '#c68642', '#8d5524'];
 const WAIT_SPOTS = [[0.8, 0.2], [0.8, 0.5], [0.8, 0.8]];   // on the platform, unrotated cell
 const SEATS = 4;            // two per carriage
 const PERSON_SIZE = 1.7;    // how big people are drawn
+const ICON_PEOPLE = [
+  { body: '#fdd835', hair: '#3e2723', skin: '#f8d5b5' },
+  { body: '#4fc3f7', hair: '#212121', skin: '#c68642' },
+];
 const HOP_TIME = 0.45;      // seconds for one hop between platform and train
 const WALK_TIME = 0.7;      // seconds to walk into the station after getting off
 let hops = [];              // passengers currently hopping on or off
+let passengersOn = true;    // the people button turns passengers on and off
+try { passengersOn = localStorage.getItem('passengers') !== 'off'; } catch (err) { /* fine */ }
+
+function togglePassengers() {
+  passengersOn = !passengersOn;
+  try { localStorage.setItem('passengers', passengersOn ? 'on' : 'off'); } catch (err) { /* fine */ }
+  if (passengersOn) {
+    for (const st of order) if (st.type === 'station') st.spawn = 0.3; // people arrive soon
+    sfx.hop(true);
+    return;
+  }
+  // Everyone disappears in a little puff
+  for (const st of order) {
+    if (st.type !== 'station') continue;
+    for (const w of st.waiting) dust(...stationPoint(st, ...WAIT_SPOTS[w.spot]));
+    st.waiting = [];
+  }
+  if (train) {
+    train.riders.forEach((r, i) => { if (r) dust(...seatPoint(i)); });
+    train.riders.fill(null);
+  }
+  hops = [];
+  sfx.pop();
+}
 
 function pick(list) { return list[Math.floor(Math.random() * list.length)]; }
 
@@ -502,6 +580,8 @@ function seatPoint(i) {
 
 // The train has just stopped at station `st`. Returns how long to wait for everyone.
 function stationArrive(st) {
+  st.excited = 0;
+  if (!passengersOn) return 1;
   let delay = 0.5;
   // Everyone on board gets off: this is their stop
   train.riders.forEach((r, i) => {
@@ -534,8 +614,9 @@ function updatePassengers(dt) {
   for (const st of order) {
     if (st.type !== 'station') continue;
     for (const w of st.waiting) w.pop = Math.min(1, w.pop + dt * 3);
+    st.excited = Math.max(0, (st.excited || 0) - dt);
     st.spawn -= dt;
-    if (st.spawn > 0) continue;
+    if (!passengersOn || st.spawn > 0) continue;
     st.spawn = 4 + Math.random() * 4;
     const used = new Set(st.waiting.map(w => w.spot));
     const spot = [0, 1, 2].find(i => !used.has(i));
@@ -555,11 +636,22 @@ function updatePassengers(dt) {
 }
 
 // A little person: a smiley face with hair, and (when standing) a coloured body.
-function drawPerson(g, x, y, p, scale = 1, alpha = 1, standing = true) {
+// `wave` (0..1 phase, or null) raises both arms and waves them.
+function drawPerson(g, x, y, p, scale = 1, alpha = 1, standing = true, wave = null) {
   const s = lay.cell * scale * PERSON_SIZE;
   g.save();
   g.globalAlpha = alpha;
   g.translate(x, y);
+  if (standing && wave !== null) {
+    const w = Math.sin(wave * Math.PI * 2) * 0.03 * s;
+    g.strokeStyle = p.skin;
+    g.lineWidth = 0.025 * s;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(-0.045 * s, 0.06 * s); g.lineTo(-0.1 * s + w, -0.04 * s);
+    g.moveTo(0.045 * s, 0.06 * s);  g.lineTo(0.1 * s + w, -0.04 * s);
+    g.stroke();
+  }
   if (standing) {
     g.fillStyle = 'rgba(0,0,0,0.2)'; g.beginPath(); g.ellipse(0, 0.13 * s, 0.06 * s, 0.02 * s, 0, 0, Math.PI * 2); g.fill();
     g.fillStyle = p.body; rr(g, -0.055 * s, 0.03 * s, 0.11 * s, 0.1 * s, 0.045 * s); g.fill();
@@ -583,9 +675,11 @@ function drawWaiting(time) {
     if (st.type !== 'station') continue;
     for (const w of st.waiting) {
       const [x, y] = stationPoint(st, ...WAIT_SPOTS[w.spot]);
-      const bob = Math.abs(Math.sin(time / 1000 * 3 + w.phase)) * lay.cell * 0.03;
+      const excited = st.excited > 0;  // the train is coming: jump and wave!
+      const bob = Math.abs(Math.sin(time / 1000 * (excited ? 8 : 3) + w.phase)) * lay.cell * (excited ? 0.08 : 0.03);
       const pop = Math.sin(w.pop * Math.PI / 2) * (1 + 0.25 * Math.sin(w.pop * Math.PI));
-      drawPerson(ctx, x, y - lay.cell * 0.1 - bob, w, pop);
+      const wave = excited ? (time / 1000 * 3 + w.phase) % 1 : null;
+      drawPerson(ctx, x, y - lay.cell * 0.1 - bob, w, pop, 1, true, wave);
     }
   }
 }
@@ -720,6 +814,8 @@ const sfx = {
   hiss() { if (!this.ok()) return; noise(0.7, 4000, 0.7, 0.25); },
   // a passenger hopping on (rising pip) or off (falling pip)
   hop(on) { if (!this.ok()) return; tone('sine', on ? 520 : 900, on ? 1040 : 450, 0.14, 0.22); },
+  // everyone's aboard: a cheerful rising chime
+  ready() { if (!this.ok()) return; tone('sine', 660, 660, 0.18, 0.2); tone('sine', 990, 990, 0.3, 0.2, 0.15); },
   // station bell: ding-ding
   bell() {
     if (!this.ok()) return;
@@ -806,13 +902,16 @@ function layout() {
     };
   });
 
-  // Drive buttons (forward, stop, backwards) and the bin.
   // Landscape: stacked down the right. Portrait: in a row along the top.
-  lay.fwd  = { r: panel * 0.36, press: 0 };
-  lay.stop = { r: panel * 0.36, press: 0 };
-  lay.back = { r: panel * 0.36, press: 0 };
-  lay.bin  = { r: panel * 0.28, press: 0 };
-  const place = [[lay.fwd, 0.15], [lay.stop, 0.37], [lay.back, 0.59], [lay.bin, 0.85]];
+  // Drive buttons, the passengers on/off button and the bin.
+  const strip = landscape ? btns.h : btns.w;
+  const big = Math.min(panel * 0.36, strip * 0.085);
+  lay.fwd    = { r: big, press: 0 };
+  lay.stop   = { r: big, press: 0 };
+  lay.back   = { r: big, press: 0 };
+  lay.people = { r: big * 0.85, press: 0 };
+  lay.bin    = { r: big * 0.75, press: 0 };
+  const place = [[lay.fwd, 0.11], [lay.stop, 0.3], [lay.back, 0.49], [lay.people, 0.69], [lay.bin, 0.88]];
   for (const [b, f] of place) {
     if (landscape) Object.assign(b, { x: btns.x + btns.w / 2, y: btns.y + btns.h * f });
     else           Object.assign(b, { x: btns.x + btns.w * (1 - f), y: btns.y + btns.h / 2 });
@@ -1200,6 +1299,13 @@ function draw(time) {
     ctx.fill();
   });
   drawButton(lay.back, '#fbc02d', () => drawDriveIcon(ctx, lay.back.r, -1, '#fbc02d'));
+  // Passengers button: purple with two little people when on, grey and faded when off
+  drawButton(lay.people, passengersOn ? '#8e24aa' : '#9e9e9e', () => {
+    const k = lay.people.r * 3.4 / (lay.cell * PERSON_SIZE);
+    const a = passengersOn ? 1 : 0.45;
+    drawPerson(ctx, -lay.people.r * 0.33, -lay.people.r * 0.22, ICON_PEOPLE[0], k, a);
+    drawPerson(ctx, lay.people.r * 0.33, -lay.people.r * 0.22, ICON_PEOPLE[1], k, a);
+  });
   // The bin grows a little when you drag a placed piece, inviting you to drop it there
   const binBig = drag && drag.piece && drag.moved;
   const binR = lay.bin.r;
@@ -1246,6 +1352,7 @@ canvas.addEventListener('pointerdown', e => {
   for (const [b, target] of [[lay.fwd, 1], [lay.stop, 0], [lay.back, -1]]) {
     if (hitCircle(b, x, y, 1.1)) { b.press = 1; drive(target); return; }
   }
+  if (hitCircle(lay.people, x, y)) { lay.people.press = 1; togglePassengers(); return; }
   if (hitCircle(lay.bin, x, y)) { lay.bin.press = 1; undo(); return; }
 
   // Pick up a new piece from the tray
@@ -1353,7 +1460,7 @@ function frame(now) {
     p.pop = Math.max(0, p.pop - dt * 4);
     p.lever += (p.set - p.lever) * Math.min(1, dt * 12);
   }
-  for (const b of [lay.fwd, lay.stop, lay.back, lay.bin]) b.press = Math.max(0, b.press - dt * 6);
+  for (const b of [lay.fwd, lay.stop, lay.back, lay.people, lay.bin]) b.press = Math.max(0, b.press - dt * 6);
   updateTrain(dt);
   updateParticles(dt);
   updatePassengers(dt);
