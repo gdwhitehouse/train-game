@@ -69,11 +69,19 @@ const PIECES = {
   curve:    [[S, E]],
   cross:    [[N, S], [E, W]],
   // Points: the "toe" (South) splits into a straight branch (North) and a
-  // curved branch (East). piece.set picks which branch is switched on (0 or 1).
-  points:   [[S, N], [S, E]],
+  // curved branch (East for right-hand, West for left-hand).
+  // piece.set picks which branch is switched on (0 or 1).
+  points:     [[S, N], [S, E]],
+  pointsLeft: [[S, N], [S, W]],
 };
-const TRAY = ['straight', 'curve', 'cross', 'points'];
-const KNOB = [0.17, 0.83]; // points lever position, in the unrotated unit cell
+const TRAY = ['straight', 'curve', 'cross', 'points', 'pointsLeft'];
+
+// Lever position (in the unrotated unit cell) and which way the curve goes
+const POINTS = {
+  points:     { knob: [0.17, 0.83], side: 1 },
+  pointsLeft: { knob: [0.83, 0.83], side: -1 },
+};
+function isPoints(type) { return type in POINTS; }
 
 const SPEED = 1.0;            // train top speed, in cells per second
 const ACCEL = 2.0;            // how quickly it speeds up and slows down
@@ -107,7 +115,7 @@ function connectionsOf(type, rot) {
 function findExit(piece, entry) {
   const conns = connectionsOf(piece.type, piece.rot);
   // Entering points at the toe: go whichever way they're switched
-  if (piece.type === 'points' && entry === conns[0][0]) return conns[piece.set][1];
+  if (isPoints(piece.type) && entry === conns[0][0]) return conns[piece.set][1];
   for (const [a, b] of conns) {
     if (a === entry) return b;
     if (b === entry) return a;
@@ -177,7 +185,8 @@ function branchIndex(p, edge) {
 function knobHit(p, x, y) {
   let u = (x - lay.gx) / lay.cell - p.c, v = (y - lay.gy) / lay.cell - p.r;
   for (let k = 0; k < p.rot; k++) [u, v] = [v, 1 - u]; // undo the piece's rotation
-  return Math.hypot(u - KNOB[0], v - KNOB[1]) < 0.32;
+  const [kx, ky] = POINTS[p.type].knob;
+  return Math.hypot(u - kx, v - ky) < 0.32;
 }
 
 function flipPoints(p) {
@@ -361,7 +370,7 @@ function updateTrain(dt) {
   // Running through points from a branch pushes them over to that branch
   // (like real sprung points), so the carriages behind follow the engine.
   const ep = pieceAt(train.c, train.r);
-  if (ep.type === 'points') {
+  if (isPoints(ep.type)) {
     let br = branchIndex(ep, train.a);
     if (br < 0) br = branchIndex(ep, train.b);
     if (br >= 0 && br !== ep.set) { ep.set = br; sfx.flip(); }
@@ -671,14 +680,14 @@ function drawPiece(g, type, rot, x, y, size, spin = 0, scale = 1, alpha = 1, set
 
   g.save();
   frame(0, 0);
-  if (type === 'points') {
+  if (isPoints(type)) {
     // Draw the switched-on branch last so its rails run unbroken through the split
     const on = conns[set], off = conns[1 - set];
     strokePaths(g, conns, TRACK_LAYERS.slice(0, 2));
     strokePaths(g, [off], TRACK_LAYERS.slice(2));
     strokePaths(g, [on], TRACK_LAYERS.slice(2));
     drawPointsArrow(g, on);
-    drawLever(g, lever);
+    drawLever(g, lever, POINTS[type]);
   } else {
     strokePaths(g, conns, TRACK_LAYERS);
   }
@@ -701,9 +710,10 @@ function drawPointsArrow(g, [a, b]) {
 }
 
 // Points lever: a red ball on a stick that leans towards the switched-on branch
-function drawLever(g, lever) {
-  const [kx, ky] = KNOB;
-  const ang = (-100 + 90 * lever) * Math.PI / 180;  // straight: up, curve: right
+function drawLever(g, lever, { knob, side }) {
+  const [kx, ky] = knob;
+  // straight: (nearly) up; curve: over towards the curved branch's side
+  const ang = (-90 - 10 * side + 90 * side * lever) * Math.PI / 180;
   const bx = kx + Math.cos(ang) * 0.15, by = ky + Math.sin(ang) * 0.15;
   g.fillStyle = 'rgba(0,0,0,0.25)'; circle(g, kx + 0.015, ky + 0.02, 0.11); g.fill();
   g.fillStyle = '#6d4c41';          circle(g, kx, ky, 0.1); g.fill();
@@ -1033,7 +1043,7 @@ canvas.addEventListener('pointerup', e => {
   drag = null;
   unlockAudio();
   if (d.piece && !d.moved) {
-    if (d.piece.type === 'points' && knobHit(d.piece, d.sx, d.sy)) flipPoints(d.piece);
+    if (isPoints(d.piece.type) && knobHit(d.piece, d.sx, d.sy)) flipPoints(d.piece);
     else rotatePiece(d.piece);
     return;
   }
