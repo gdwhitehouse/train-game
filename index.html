@@ -68,8 +68,12 @@ const PIECES = {
   straight: [[N, S]],
   curve:    [[S, E]],
   cross:    [[N, S], [E, W]],
+  // Points: the "toe" (South) splits into a straight branch (North) and a
+  // curved branch (East). piece.set picks which branch is switched on (0 or 1).
+  points:   [[S, N], [S, E]],
 };
-const TRAY = ['straight', 'curve', 'cross'];
+const TRAY = ['straight', 'curve', 'cross', 'points'];
+const KNOB = [0.17, 0.83]; // points lever position, in the unrotated unit cell
 
 const SPEED = 1.0;            // train speed, in cells per second
 const GAP = 0.62;             // distance between carriage centres (cells)
@@ -100,7 +104,10 @@ function connectionsOf(type, rot) {
 
 // If a train enters `piece` through edge `entry`, which edge does it leave by? (-1 = none)
 function findExit(piece, entry) {
-  for (const [a, b] of connectionsOf(piece.type, piece.rot)) {
+  const conns = connectionsOf(piece.type, piece.rot);
+  // Entering points at the toe: go whichever way they're switched
+  if (piece.type === 'points' && entry === conns[0][0]) return conns[piece.set][1];
+  for (const [a, b] of conns) {
     if (a === entry) return b;
     if (b === entry) return a;
   }
@@ -135,11 +142,11 @@ function bestRotation(type, c, r, preferred) {
   return best;
 }
 
-function placePiece(type, c, r, preferredRot, smart) {
+function placePiece(type, c, r, preferredRot, smart, set = 0) {
   const old = pieceAt(c, r);
   if (old) removePiece(old);
   const rot = smart ? bestRotation(type, c, r, preferredRot) : preferredRot;
-  const p = { type, rot, c, r, spin: 0, pop: 1 };
+  const p = { type, rot, c, r, spin: 0, pop: 1, set, lever: set };
   grid[r * COLS + c] = p;
   order.push(p);
   sfx.click();
@@ -157,6 +164,26 @@ function rotatePiece(p) {
   p.rot = (p.rot + 1) % 4;
   p.spin = -Math.PI / 2; // visual: animate from the old angle to the new one
   sfx.rotate();
+}
+
+// Which branch of a points piece ends at `edge`? (-1 if it's the toe or not on the piece)
+function branchIndex(p, edge) {
+  const conns = connectionsOf(p.type, p.rot);
+  return conns[0][1] === edge ? 0 : conns[1][1] === edge ? 1 : -1;
+}
+
+// Was the tap at (x,y) on the lever knob of points piece p?
+function knobHit(p, x, y) {
+  let u = (x - lay.gx) / lay.cell - p.c, v = (y - lay.gy) / lay.cell - p.r;
+  for (let k = 0; k < p.rot; k++) [u, v] = [v, 1 - u]; // undo the piece's rotation
+  return Math.hypot(u - KNOB[0], v - KNOB[1]) < 0.32;
+}
+
+function flipPoints(p) {
+  // Never switch under the train (the carriages would jump): just toot instead
+  if (trainCells().has(p.c + ',' + p.r)) { sfx.toot(); return; }
+  p.set = 1 - p.set;
+  sfx.flip();
 }
 
 function undo() {
@@ -264,7 +291,7 @@ function startTrain() {
     const [a, b] = connectionsOf(p.type, p.rot)[0];
     start = { c: p.c, r: p.r, a, b, t: 0.5 };
   }
-  train = Object.assign(start, { dir: 1, pause: 0.6, chuff: 0, beat: 0 });
+  train = Object.assign(start, { dir: 1, pause: 0.6, chuff: 0, beat: 0, backing: 0 });
   sfx.toot();
 }
 
@@ -273,6 +300,18 @@ function removeTrain() {
   const [x, y] = worldPoint(train);
   for (let i = 0; i < 6; i++) puff(x, y, 1.6);
   train = null;
+}
+
+// The grid squares the train is currently covering, as "c,r" strings.
+function trainCells() {
+  const cells = new Set();
+  if (!train) return cells;
+  for (let d = -0.3; d <= TRAIN_LEN + 0.05; d += 0.1) {
+    const p = clonePos(train);
+    travel(p, -d);
+    cells.add(p.c + ',' + p.r);
+  }
+  return cells;
 }
 
 // How far short of the rear of the train does the track run out? (0 = room for all)
@@ -293,12 +332,21 @@ function checkTrain() {
 
 function reverseTrain() {
   train.dir = -train.dir;
+  train.backing = 0;
   train.pause = 0.9;
   sfx.toot();
 }
 
 function updateTrain(dt) {
   if (!train || !checkTrain()) return;
+  // Running through points from a branch pushes them over to that branch
+  // (like real sprung points), so the carriages behind follow the engine.
+  const ep = pieceAt(train.c, train.r);
+  if (ep.type === 'points') {
+    let br = branchIndex(ep, train.a);
+    if (br < 0) br = branchIndex(ep, train.b);
+    if (br >= 0 && br !== ep.set) { ep.set = br; sfx.flip(); }
+  }
   if (train.pause > 0) { train.pause -= dt; return; }
 
   const step = SPEED * dt;
@@ -310,7 +358,9 @@ function updateTrain(dt) {
     const before = rearShortfall(train);
     const probe = clonePos(train);
     const left = travel(probe, -step);
-    if (left > 0 || (before === 0 && rearShortfall(probe) > 0)) reverseTrain();
+    // Also stop backing after a while (e.g. it backed out of a siding onto a loop)
+    train.backing += dt;
+    if (left > 0 || (before === 0 && rearShortfall(probe) > 0) || train.backing > 6) reverseTrain();
     else Object.assign(train, probe);
   }
 
@@ -427,6 +477,12 @@ const sfx = {
   rotate() { if (!this.ok()) return; noise(0.05, 3200, 5, 0.4); tone('triangle', 520, 380, 0.06, 0.25); },
   pick()   { if (!this.ok()) return; tone('sine', 480, 820, 0.09, 0.2); },
   pop()    { if (!this.ok()) return; tone('sine', 700, 110, 0.2, 0.35); },
+  // points lever: a chunky clunk-clunk
+  flip()   {
+    if (!this.ok()) return;
+    noise(0.06, 1400, 3, 0.55); tone('triangle', 240, 150, 0.1, 0.4);
+    noise(0.05, 1900, 4, 0.4, 0.07);
+  },
   // steam chuff: a short burst of filtered noise
   chuff(strong) { if (!this.ok()) return; noise(0.15, strong ? 700 : 900, 0.9, strong ? 0.5 : 0.28); },
   // two-note whistle: whoo-whoo!
@@ -555,29 +611,80 @@ const TRACK_LAYERS = [
   { w: 0.21, c: '#f3c887' },
 ];
 
-// Draw a track piece centred at (x,y), `size` pixels across.
-function drawPiece(g, type, rot, x, y, size, spin = 0, scale = 1, alpha = 1) {
-  const conns = connectionsOf(type, rot);
-  g.save();
-  g.globalAlpha = alpha;
-  g.translate(x, y);
-  g.rotate(spin);
-  g.scale(size * scale, size * scale);
-  g.translate(-0.5, -0.5);
-  g.lineCap = 'butt';
-  // soft shadow
-  g.save();
-  g.translate(0.025, 0.035);
-  g.strokeStyle = 'rgba(0,0,0,0.22)';
-  g.lineWidth = 0.54;
-  for (const [a, b] of conns) { tracePath(g, a, b); g.stroke(); }
-  g.restore();
-  for (const layer of TRACK_LAYERS) {
+function strokePaths(g, conns, layers) {
+  for (const layer of layers) {
     g.strokeStyle = layer.c;
     g.lineWidth = layer.w;
     for (const [a, b] of conns) { tracePath(g, a, b); g.stroke(); }
   }
+}
+
+// Draw a track piece centred at (x,y), `size` pixels across. The piece is drawn
+// in its unrotated shape and the canvas is turned, so the lever turns with it.
+// For points, `set` is the switched branch and `lever` animates between 0 and 1.
+function drawPiece(g, type, rot, x, y, size, spin = 0, scale = 1, alpha = 1, set = 0, lever = 0) {
+  const conns = PIECES[type];
+  const s = size * scale;
+  const frame = (dx, dy) => {
+    g.translate(x + dx, y + dy);
+    g.rotate(spin + rot * Math.PI / 2);
+    g.scale(s, s);
+    g.translate(-0.5, -0.5);
+  };
+  g.save();
+  g.globalAlpha = alpha;
+  g.lineCap = 'butt';
+
+  // soft shadow, always falling down and to the right on screen
+  g.save();
+  frame(s * 0.025, s * 0.035);
+  strokePaths(g, conns, [{ w: 0.54, c: 'rgba(0,0,0,0.22)' }]);
   g.restore();
+
+  g.save();
+  frame(0, 0);
+  if (type === 'points') {
+    // Draw the switched-on branch last so its rails run unbroken through the split
+    const on = conns[set], off = conns[1 - set];
+    strokePaths(g, conns, TRACK_LAYERS.slice(0, 2));
+    strokePaths(g, [off], TRACK_LAYERS.slice(2));
+    strokePaths(g, [on], TRACK_LAYERS.slice(2));
+    drawPointsArrow(g, on);
+    drawLever(g, lever);
+  } else {
+    strokePaths(g, conns, TRACK_LAYERS);
+  }
+  g.restore();
+  g.restore();
+}
+
+// A little white arrow on the branch the train will take
+function drawPointsArrow(g, [a, b]) {
+  const [x0, y0] = pathPoint(a, b, 0.5), [x1, y1] = pathPoint(a, b, 0.62);
+  g.save();
+  g.translate(x1, y1);
+  g.rotate(Math.atan2(y1 - y0, x1 - x0));
+  g.fillStyle = 'rgba(255,255,255,0.9)';
+  g.beginPath();
+  g.moveTo(0.07, 0); g.lineTo(-0.05, -0.065); g.lineTo(-0.05, 0.065);
+  g.closePath();
+  g.fill();
+  g.restore();
+}
+
+// Points lever: a red ball on a stick that leans towards the switched-on branch
+function drawLever(g, lever) {
+  const [kx, ky] = KNOB;
+  const ang = (-100 + 90 * lever) * Math.PI / 180;  // straight: up, curve: right
+  const bx = kx + Math.cos(ang) * 0.15, by = ky + Math.sin(ang) * 0.15;
+  g.fillStyle = 'rgba(0,0,0,0.25)'; circle(g, kx + 0.015, ky + 0.02, 0.11); g.fill();
+  g.fillStyle = '#6d4c41';          circle(g, kx, ky, 0.1); g.fill();
+  g.strokeStyle = '#3e2723';
+  g.lineWidth = 0.045;
+  g.lineCap = 'round';
+  g.beginPath(); g.moveTo(kx, ky); g.lineTo(bx, by); g.stroke();
+  g.fillStyle = '#e53935';          circle(g, bx, by, 0.105); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.6)'; circle(g, bx - 0.03, by - 0.03, 0.035); g.fill();
 }
 
 // Top-down engine, drawn in "cell units" facing +x.
@@ -736,7 +843,8 @@ function draw(time) {
   // Placed pieces (with rotate and "pop" animations)
   for (const p of order) {
     const bounce = 1 + 0.15 * Math.sin(Math.PI * p.pop);
-    drawPiece(ctx, p.type, p.rot, gx + (p.c + 0.5) * cell, gy + (p.r + 0.5) * cell, cell, p.spin, bounce);
+    drawPiece(ctx, p.type, p.rot, gx + (p.c + 0.5) * cell, gy + (p.r + 0.5) * cell, cell,
+              p.spin, bounce, 1, p.set, p.lever);
   }
 
   // Train: carriages trail behind the engine along the track
@@ -795,7 +903,7 @@ function draw(time) {
     ctx.shadowColor = 'rgba(0,0,0,0.3)';
     ctx.shadowBlur = 12;
     ctx.shadowOffsetY = 8;
-    drawPiece(ctx, drag.type, drag.rot, drag.x, drag.y, cell * 1.05, 0, 1, 0.9);
+    drawPiece(ctx, drag.type, drag.rot, drag.x, drag.y, cell * 1.05, 0, 1, 0.9, drag.set, drag.set);
     ctx.restore();
   }
 }
@@ -831,19 +939,19 @@ canvas.addEventListener('pointerdown', e => {
   // Pick up a new piece from the tray
   for (const s of lay.slots) {
     if (Math.abs(x - s.x) < s.s * 0.6 && Math.abs(y - s.y) < s.s * 0.6) {
-      drag = { id: e.pointerId, type: s.type, rot: 0, piece: null, x, y, sx: x, sy: y, moved: true };
+      drag = { id: e.pointerId, type: s.type, rot: 0, set: 0, piece: null, x, y, sx: x, sy: y, moved: true };
       canvas.setPointerCapture(e.pointerId);
       sfx.pick();
       return;
     }
   }
 
-  // Touch a placed piece: tap to rotate, or drag to move/remove
+  // Touch a placed piece: tap to rotate (or flip a points lever), or drag to move/remove
   const t = cellAt(x, y, false);
   const p = t && pieceAt(t.c, t.r);
   if (p) {
     if (train && train.c === p.c && train.r === p.r) { sfx.toot(); return; } // tapping the engine toots
-    drag = { id: e.pointerId, type: p.type, rot: p.rot, piece: p, x, y, sx: x, sy: y, moved: false };
+    drag = { id: e.pointerId, type: p.type, rot: p.rot, set: p.set, piece: p, x, y, sx: x, sy: y, moved: false };
     canvas.setPointerCapture(e.pointerId);
   }
 });
@@ -863,10 +971,14 @@ canvas.addEventListener('pointerup', e => {
   const d = drag;
   drag = null;
   unlockAudio();
-  if (d.piece && !d.moved) { rotatePiece(d.piece); return; }
+  if (d.piece && !d.moved) {
+    if (d.piece.type === 'points' && knobHit(d.piece, d.sx, d.sy)) flipPoints(d.piece);
+    else rotatePiece(d.piece);
+    return;
+  }
   if (d.piece && hitCircle(lay.bin, d.x, d.y, 1.6)) { sfx.pop(); dust(d.x, d.y); return; }
   const t = cellAt(d.x, d.y, true);
-  if (t) placePiece(d.type, t.c, t.r, d.rot, true);
+  if (t) placePiece(d.type, t.c, t.r, d.rot, true, d.set);
   else if (d.piece) { sfx.pop(); dust(d.x, d.y); } // dragged off the board: gone
 });
 
@@ -927,6 +1039,7 @@ function frame(now) {
   for (const p of order) {
     p.spin *= Math.max(0, 1 - dt * 14);
     p.pop = Math.max(0, p.pop - dt * 4);
+    p.lever += (p.set - p.lever) * Math.min(1, dt * 12);
   }
   lay.go.press = Math.max(0, lay.go.press - dt * 6);
   lay.bin.press = Math.max(0, lay.bin.press - dt * 6);
