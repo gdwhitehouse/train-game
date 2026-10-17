@@ -75,7 +75,8 @@ const PIECES = {
 const TRAY = ['straight', 'curve', 'cross', 'points'];
 const KNOB = [0.17, 0.83]; // points lever position, in the unrotated unit cell
 
-const SPEED = 1.0;            // train speed, in cells per second
+const SPEED = 1.0;            // train top speed, in cells per second
+const ACCEL = 2.0;            // how quickly it speeds up and slows down
 const GAP = 0.62;             // distance between carriage centres (cells)
 const TRAIN_LEN = GAP * 2 + 0.25;
 const CAR_COLOURS = ['#fdd835', '#42a5f5'];
@@ -85,7 +86,7 @@ const CAR_COLOURS = ['#fdd835', '#42a5f5'];
    ===================================================================== */
 const grid = new Array(COLS * ROWS).fill(null); // piece or null per cell
 const order = [];                               // pieces in the order placed (for undo)
-let train = null;                               // {c,r,a,b,t,dir,pause,chuff,beat}
+let train = null;                               // {c,r,a,b,t,speed,target,chuff,beat}
 let drag = null;                                // current finger drag, if any
 const particles = [];                           // smoke puffs and dust
 
@@ -268,31 +269,56 @@ function worldPoint(pos) {
 /* =====================================================================
    THE TRAIN
    ===================================================================== */
-function startTrain() {
-  if (!order.length) { sfx.toot(); return; }
-
-  // Prefer starting at an open end (so the whole train fits behind the engine);
-  // on a closed loop just start on the first piece placed.
+// Put the train on the track, ready to set off in direction `dir` (1 or -1).
+function startTrain(dir) {
+  // Prefer starting at an open end, with the train pointing away from the end
+  // it's about to drive away from. On a closed loop start on the first piece placed.
   let start = null;
   search:
   for (const p of order) {
     for (const [x, y] of connectionsOf(p.type, p.rot)) {
       for (const [from, to] of [[x, y], [y, x]]) {
         if (!neighbourConnects(p.c, p.r, from)) {
-          start = { c: p.c, r: p.r, a: from, b: to, t: 0 };
+          if (dir > 0) {
+            // Engine leads away from the end; carriages trail back to the end
+            start = { c: p.c, r: p.r, a: from, b: to, t: 0 };
+            travel(start, TRAIN_LEN);
+          } else {
+            // Engine sits at the end facing it; it will push the carriages away
+            start = { c: p.c, r: p.r, a: to, b: from, t: 0.95 };
+          }
           break search;
         }
       }
     }
   }
-  if (start) travel(start, TRAIN_LEN);
-  else {
+  if (!start) {
     const p = order[0];
     const [a, b] = connectionsOf(p.type, p.rot)[0];
     start = { c: p.c, r: p.r, a, b, t: 0.5 };
   }
-  train = Object.assign(start, { dir: 1, pause: 0.6, chuff: 0, beat: 0, backing: 0 });
-  sfx.toot();
+  train = Object.assign(start, { speed: 0, target: 0, chuff: 0, beat: 0 });
+}
+
+// The drive buttons: 1 = forward, 0 = stop, -1 = backwards.
+function drive(target) {
+  if (!train) {
+    if (target === 0 || !order.length) { sfx.toot(); return; }
+    startTrain(target);
+  }
+  if (target === train.target) return;
+  if (target === 0) sfx.hiss();
+  else if (train.target === 0) sfx.toot();
+  train.target = target;
+}
+
+// Reached the end of the track: bump to a stop and wait for the other button.
+function bump() {
+  train.speed = 0;
+  train.target = 0;
+  train.jolt = 1;
+  sfx.bump();
+  sfx.toot(0.25);
 }
 
 function removeTrain() {
@@ -330,13 +356,6 @@ function checkTrain() {
   return true;
 }
 
-function reverseTrain() {
-  train.dir = -train.dir;
-  train.backing = 0;
-  train.pause = 0.9;
-  sfx.toot();
-}
-
 function updateTrain(dt) {
   if (!train || !checkTrain()) return;
   // Running through points from a branch pushes them over to that branch
@@ -347,25 +366,29 @@ function updateTrain(dt) {
     if (br < 0) br = branchIndex(ep, train.b);
     if (br >= 0 && br !== ep.set) { ep.set = br; sfx.flip(); }
   }
-  if (train.pause > 0) { train.pause -= dt; return; }
+  train.jolt = Math.max(0, (train.jolt || 0) - dt * 3);
 
-  const step = SPEED * dt;
-  if (train.dir > 0) {
-    // Engine first: stop and turn round when the engine reaches an open end.
-    if (travel(train, step) > 0) reverseTrain();
+  // Ease the speed towards what the buttons ask for
+  const want = train.target * SPEED;
+  const dv = ACCEL * dt;
+  train.speed += Math.max(-dv, Math.min(dv, want - train.speed));
+  if (Math.abs(train.speed) < 0.001) return;
+
+  const step = train.speed * dt;
+  if (step > 0) {
+    // Engine first: bump to a stop when the engine reaches an open end
+    if (travel(train, step) > 0) bump();
   } else {
-    // Backing up: turn round when the last carriage reaches an open end.
+    // Backing up: bump to a stop when the last carriage reaches an open end
     const before = rearShortfall(train);
     const probe = clonePos(train);
-    const left = travel(probe, -step);
-    // Also stop backing after a while (e.g. it backed out of a siding onto a loop)
-    train.backing += dt;
-    if (left > 0 || (before === 0 && rearShortfall(probe) > 0) || train.backing > 6) reverseTrain();
+    const left = travel(probe, step);
+    if (left > 0 || (before === 0 && rearShortfall(probe) > 0)) bump();
     else Object.assign(train, probe);
   }
 
-  // Choo-choo: a chuff sound and a smoke puff on every beat
-  train.chuff -= dt;
+  // Choo-choo: a chuff sound and a smoke puff on every beat (slower when slow)
+  train.chuff -= dt * Math.abs(train.speed) / SPEED;
   if (train.chuff <= 0) {
     train.chuff = 0.3 / SPEED;
     train.beat++;
@@ -486,11 +509,15 @@ const sfx = {
   // steam chuff: a short burst of filtered noise
   chuff(strong) { if (!this.ok()) return; noise(0.15, strong ? 700 : 900, 0.9, strong ? 0.5 : 0.28); },
   // two-note whistle: whoo-whoo!
-  toot() {
+  // stopping: a soft hiss of steam
+  hiss() { if (!this.ok()) return; noise(0.7, 4000, 0.7, 0.25); },
+  // hitting the buffers at the end of the track
+  bump() { if (!this.ok()) return; tone('sine', 140, 55, 0.25, 0.6); noise(0.08, 500, 1.5, 0.5); },
+  toot(delay = 0) {
     if (!this.ok()) return;
     for (const [start, dur] of [[0, 0.22], [0.3, 0.45]]) {
       for (const f of [587, 740]) {
-        const t = ac.currentTime + start;
+        const t = ac.currentTime + delay + start;
         const o = ac.createOscillator(), g = ac.createGain();
         o.type = 'triangle';
         o.frequency.setValueAtTime(f * 0.97, t);
@@ -562,15 +589,16 @@ function layout() {
     };
   });
 
-  // Go button (big) and bin button
-  lay.go  = { r: panel * 0.4, press: 0 };
-  lay.bin = { r: panel * 0.3, press: 0 };
-  if (landscape) {
-    Object.assign(lay.go,  { x: btns.x + btns.w / 2, y: btns.y + btns.h * 0.32 });
-    Object.assign(lay.bin, { x: btns.x + btns.w / 2, y: btns.y + btns.h * 0.78 });
-  } else {
-    Object.assign(lay.go,  { x: btns.x + btns.w * 0.72, y: btns.y + btns.h / 2 });
-    Object.assign(lay.bin, { x: btns.x + btns.w * 0.25, y: btns.y + btns.h / 2 });
+  // Drive buttons (forward, stop, backwards) and the bin.
+  // Landscape: stacked down the right. Portrait: in a row along the top.
+  lay.fwd  = { r: panel * 0.36, press: 0 };
+  lay.stop = { r: panel * 0.36, press: 0 };
+  lay.back = { r: panel * 0.36, press: 0 };
+  lay.bin  = { r: panel * 0.28, press: 0 };
+  const place = [[lay.fwd, 0.15], [lay.stop, 0.37], [lay.back, 0.59], [lay.bin, 0.85]];
+  for (const [b, f] of place) {
+    if (landscape) Object.assign(b, { x: btns.x + btns.w / 2, y: btns.y + btns.h * f });
+    else           Object.assign(b, { x: btns.x + btns.w * (1 - f), y: btns.y + btns.h / 2 });
   }
 
   drawScenery();
@@ -732,6 +760,24 @@ function drawTrainIcon(g, x, y, r, bgColour) {
   g.restore();
 }
 
+// Forward / backwards icon: a little engine facing right with an arrow out of
+// its front (dir 1) or out of its back (dir -1). Drawn at the button's centre.
+function drawDriveIcon(g, r, dir, bgColour) {
+  g.save();
+  g.translate(-dir * r * 0.2, 0);
+  g.scale(-1, 1); // the train icon faces left; flip it to face right
+  drawTrainIcon(g, 0, 0, r * 0.45, bgColour);
+  g.restore();
+  const tipX = dir * r * 0.72, baseX = dir * r * 0.36;
+  g.fillStyle = '#fff';
+  g.beginPath();
+  g.moveTo(tipX, 0);
+  g.lineTo(baseX, -r * 0.26);
+  g.lineTo(baseX, r * 0.26);
+  g.closePath();
+  g.fill();
+}
+
 function drawBinIcon(g, x, y, r) {
   g.save();
   g.translate(x, y);
@@ -854,6 +900,11 @@ function draw(time) {
       travel(pos, -GAP * i);
       return carPose(pos);
     });
+    // A little shudder after bumping into the buffers
+    const jolt = train.jolt || 0;
+    const jx = Math.sin(jolt * 25) * jolt * cell * 0.05;
+    ctx.save();
+    ctx.translate(Math.cos(poses[0].a) * jx, Math.sin(poses[0].a) * jx);
     ctx.strokeStyle = '#4e342e';
     ctx.lineWidth = cell * 0.05;
     ctx.beginPath();
@@ -869,6 +920,7 @@ function draw(time) {
       if (i === 0) drawEngine(ctx); else drawCarriage(ctx, CAR_COLOURS[i - 1]);
       ctx.restore();
     }
+    ctx.restore();
   }
 
   // Smoke and dust
@@ -879,17 +931,24 @@ function draw(time) {
     ctx.fill();
   }
 
-  // Buttons. The Go button glows orange and pulses while the train runs.
-  const running = !!train;
-  const goColour = running ? '#fb8c00' : '#43a047';
-  if (running) {
+  // Drive buttons. The one the train is obeying has a pulsing ring.
+  const target = train ? train.target : 0;
+  const active = target > 0 ? lay.fwd : target < 0 ? lay.back : null;
+  if (active) {
     const pulse = (time / 1000) % 1;
-    ctx.strokeStyle = `rgba(255,255,255,${0.6 * (1 - pulse)})`;
+    ctx.strokeStyle = `rgba(255,255,255,${0.7 * (1 - pulse)})`;
     ctx.lineWidth = 6;
-    circle(ctx, lay.go.x, lay.go.y, lay.go.r * (1 + 0.3 * pulse));
+    circle(ctx, active.x, active.y, active.r * (1 + 0.3 * pulse));
     ctx.stroke();
   }
-  drawButton(lay.go, goColour, () => drawTrainIcon(ctx, 0, 0, lay.go.r * 0.62, goColour));
+  drawButton(lay.fwd, '#43a047', () => drawDriveIcon(ctx, lay.fwd.r, 1, '#43a047'));
+  drawButton(lay.stop, '#e53935', () => {
+    ctx.fillStyle = '#fff';
+    const s = lay.stop.r * 0.62;
+    rr(ctx, -s / 2, -s / 2, s, s, s * 0.15);
+    ctx.fill();
+  });
+  drawButton(lay.back, '#fbc02d', () => drawDriveIcon(ctx, lay.back.r, -1, '#fbc02d'));
   // The bin grows a little when you drag a placed piece, inviting you to drop it there
   const binBig = drag && drag.piece && drag.moved;
   const binR = lay.bin.r;
@@ -933,7 +992,9 @@ canvas.addEventListener('pointerdown', e => {
   if (drag) return; // ignore extra fingers
   const x = e.clientX, y = e.clientY;
 
-  if (hitCircle(lay.go, x, y))  { lay.go.press = 1;  train ? removeTrain() : startTrain(); return; }
+  for (const [b, target] of [[lay.fwd, 1], [lay.stop, 0], [lay.back, -1]]) {
+    if (hitCircle(b, x, y, 1.1)) { b.press = 1; drive(target); return; }
+  }
   if (hitCircle(lay.bin, x, y)) { lay.bin.press = 1; undo(); return; }
 
   // Pick up a new piece from the tray
@@ -1041,8 +1102,7 @@ function frame(now) {
     p.pop = Math.max(0, p.pop - dt * 4);
     p.lever += (p.set - p.lever) * Math.min(1, dt * 12);
   }
-  lay.go.press = Math.max(0, lay.go.press - dt * 6);
-  lay.bin.press = Math.max(0, lay.bin.press - dt * 6);
+  for (const b of [lay.fwd, lay.stop, lay.back, lay.bin]) b.press = Math.max(0, b.press - dt * 6);
   updateTrain(dt);
   updateParticles(dt);
   draw(now);
