@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<!-- Lock the page: no zoom, fill the whole screen (including round corners / notch area) -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<!-- Home-screen web app: runs full-screen with no Safari bars -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Choo Choo">
+<meta name="format-detection" content="telephone=no">
+<meta name="theme-color" content="#d9a066">
+<title>Choo Choo</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #d9a066;
+    /* No scrolling, zooming, selecting or long-press menus */
+    position: fixed;
+    inset: 0;
+    touch-action: none;
+    overscroll-behavior: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  canvas {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+    touch-action: none;
+  }
+  /* Invisible helper used to read the iPad's safe-area insets from JS */
+  #safe {
+    position: fixed;
+    visibility: hidden;
+    pointer-events: none;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right)
+             env(safe-area-inset-bottom) env(safe-area-inset-left);
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="safe"></div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   CONSTANTS & TRACK PIECES
+   Edges of a grid cell are numbered clockwise: 0=North 1=East 2=South 3=West.
+   Each piece type is a list of connections; a connection joins two edges.
+   ===================================================================== */
+const COLS = 7, ROWS = 5;
+const N = 0, E = 1, S = 2, W = 3;
+const DX = [0, 1, 0, -1];
+const DY = [-1, 0, 1, 0];
+const EDGE_POINT = [[0.5, 0], [1, 0.5], [0.5, 1], [0, 0.5]]; // edge midpoints in a unit cell
+
+const PIECES = {
+  straight: [[N, S]],
+  curve:    [[S, E]],
+  cross:    [[N, S], [E, W]],
+};
+const TRAY = ['straight', 'curve', 'cross'];
+
+const SPEED = 1.0;            // train speed, in cells per second
+const GAP = 0.62;             // distance between carriage centres (cells)
+const TRAIN_LEN = GAP * 2 + 0.25;
+const CAR_COLOURS = ['#fdd835', '#42a5f5'];
+
+/* =====================================================================
+   GAME STATE
+   ===================================================================== */
+const grid = new Array(COLS * ROWS).fill(null); // piece or null per cell
+const order = [];                               // pieces in the order placed (for undo)
+let train = null;                               // {c,r,a,b,t,dir,pause,chuff,beat}
+let drag = null;                                // current finger drag, if any
+const particles = [];                           // smoke puffs and dust
+
+/* =====================================================================
+   PIECE HELPERS
+   ===================================================================== */
+function pieceAt(c, r) {
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return null;
+  return grid[r * COLS + c];
+}
+
+// The piece's connections after applying its rotation (quarter turns clockwise).
+function connectionsOf(type, rot) {
+  return PIECES[type].map(([a, b]) => [(a + rot) % 4, (b + rot) % 4]);
+}
+
+// If a train enters `piece` through edge `entry`, which edge does it leave by? (-1 = none)
+function findExit(piece, entry) {
+  for (const [a, b] of connectionsOf(piece.type, piece.rot)) {
+    if (a === entry) return b;
+    if (b === entry) return a;
+  }
+  return -1;
+}
+
+// Does the neighbour across edge `e` of cell (c,r) have track pointing back at us?
+function neighbourConnects(c, r, e) {
+  const nb = pieceAt(c + DX[e], r + DY[e]);
+  return !!nb && findExit(nb, (e + 2) % 4) >= 0;
+}
+
+// Pick the rotation that joins up best with the track around it. This "smart snap"
+// means a toddler can drop a piece roughly in place and it usually just fits.
+function bestRotation(type, c, r, preferred) {
+  let best = preferred, bestScore = -Infinity;
+  for (let k = 0; k < 4; k++) {
+    const rot = (preferred + k) % 4;
+    const mine = new Set(connectionsOf(type, rot).flat());
+    let score = 0;
+    for (let e = 0; e < 4; e++) {
+      const nc = c + DX[e], nr = r + DY[e];
+      const inside = nc >= 0 && nr >= 0 && nc < COLS && nr < ROWS;
+      const theirs = neighbourConnects(c, r, e);
+      if (mine.has(e) && theirs) score += 2;             // joins up: great
+      else if (mine.has(e) && pieceAt(nc, nr)) score -= 1; // points into the side of a piece
+      else if (!mine.has(e) && theirs) score -= 1;       // blocks a neighbour's open end
+      if (mine.has(e) && !inside) score -= 0.5;          // points off the board
+    }
+    if (score > bestScore) { bestScore = score; best = rot; }
+  }
+  return best;
+}
+
+function placePiece(type, c, r, preferredRot, smart) {
+  const old = pieceAt(c, r);
+  if (old) removePiece(old);
+  const rot = smart ? bestRotation(type, c, r, preferredRot) : preferredRot;
+  const p = { type, rot, c, r, spin: 0, pop: 1 };
+  grid[r * COLS + c] = p;
+  order.push(p);
+  sfx.click();
+  dust(lay.gx + (c + 0.5) * lay.cell, lay.gy + (r + 0.5) * lay.cell);
+  return p;
+}
+
+function removePiece(p) {
+  grid[p.r * COLS + p.c] = null;
+  const i = order.indexOf(p);
+  if (i >= 0) order.splice(i, 1);
+}
+
+function rotatePiece(p) {
+  p.rot = (p.rot + 1) % 4;
+  p.spin = -Math.PI / 2; // visual: animate from the old angle to the new one
+  sfx.rotate();
+}
+
+function undo() {
+  const p = order[order.length - 1];
+  if (!p) { sfx.pop(); return; }
+  removePiece(p);
+  sfx.pop();
+  dust(lay.gx + (p.c + 0.5) * lay.cell, lay.gy + (p.r + 0.5) * lay.cell);
+}
+
+/* =====================================================================
+   TRACK GEOMETRY
+   A path runs across one cell from edge a to edge b. Straights are lines,
+   curves are quarter circles (radius ½ cell) round the corner between a and b.
+   ===================================================================== */
+function isStraight(a, b) { return (a + 2) % 4 === b; }
+
+function curveInfo(a, b) {
+  const cx = (a === E || b === E) ? 1 : 0;
+  const cy = (a === S || b === S) ? 1 : 0;
+  const pa = EDGE_POINT[a], pb = EDGE_POINT[b];
+  const a0 = Math.atan2(pa[1] - cy, pa[0] - cx);
+  let d = Math.atan2(pb[1] - cy, pb[0] - cx) - a0;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return { cx, cy, a0, d };
+}
+
+// Point at fraction t (0..1) along the path from edge a to edge b, in unit-cell coords.
+function pathPoint(a, b, t) {
+  if (isStraight(a, b)) {
+    const pa = EDGE_POINT[a], pb = EDGE_POINT[b];
+    return [pa[0] + (pb[0] - pa[0]) * t, pa[1] + (pb[1] - pa[1]) * t];
+  }
+  const { cx, cy, a0, d } = curveInfo(a, b);
+  const ang = a0 + d * t;
+  return [cx + 0.5 * Math.cos(ang), cy + 0.5 * Math.sin(ang)];
+}
+
+function pathLength(a, b) { return isStraight(a, b) ? 1 : Math.PI / 4; }
+
+/* =====================================================================
+   MOVING ALONG THE TRACK
+   A track position is {c, r, a, b, t}: in cell (c,r), on the path from edge a
+   to edge b, fraction t of the way along. "Forward" means towards b.
+   ===================================================================== */
+function clonePos(p) { return { c: p.c, r: p.r, a: p.a, b: p.b, t: p.t }; }
+
+// Move `pos` by `dist` cells (negative = backwards), hopping between connected
+// pieces. Returns how much distance was left over when the track ran out (0 = fine).
+function travel(pos, dist) {
+  for (let guard = 0; guard < 100 && dist !== 0; guard++) {
+    const len = pathLength(pos.a, pos.b);
+    if (dist > 0) {
+      const room = (1 - pos.t) * len;
+      if (dist <= room) { pos.t += dist / len; return 0; }
+      dist -= room; pos.t = 1;
+      const nc = pos.c + DX[pos.b], nr = pos.r + DY[pos.b], entry = (pos.b + 2) % 4;
+      const np = pieceAt(nc, nr);
+      const exit = np ? findExit(np, entry) : -1;
+      if (exit < 0) return dist;                       // open end ahead
+      pos.c = nc; pos.r = nr; pos.a = entry; pos.b = exit; pos.t = 0;
+    } else {
+      const room = pos.t * len;
+      if (-dist <= room) { pos.t += dist / len; return 0; }
+      dist += room; pos.t = 0;
+      const nc = pos.c + DX[pos.a], nr = pos.r + DY[pos.a], entry = (pos.a + 2) % 4;
+      const np = pieceAt(nc, nr);
+      const other = np ? findExit(np, entry) : -1;
+      if (other < 0) return -dist;                     // open end behind
+      pos.c = nc; pos.r = nr; pos.a = other; pos.b = entry; pos.t = 1;
+    }
+  }
+  return Math.abs(dist);
+}
+
+function worldPoint(pos) {
+  const p = pathPoint(pos.a, pos.b, pos.t);
+  return [lay.gx + (pos.c + p[0]) * lay.cell, lay.gy + (pos.r + p[1]) * lay.cell];
+}
+
+/* =====================================================================
+   THE TRAIN
+   ===================================================================== */
+function startTrain() {
+  if (!order.length) { sfx.toot(); return; }
+
+  // Prefer starting at an open end (so the whole train fits behind the engine);
+  // on a closed loop just start on the first piece placed.
+  let start = null;
+  search:
+  for (const p of order) {
+    for (const [x, y] of connectionsOf(p.type, p.rot)) {
+      for (const [from, to] of [[x, y], [y, x]]) {
+        if (!neighbourConnects(p.c, p.r, from)) {
+          start = { c: p.c, r: p.r, a: from, b: to, t: 0 };
+          break search;
+        }
+      }
+    }
+  }
+  if (start) travel(start, TRAIN_LEN);
+  else {
+    const p = order[0];
+    const [a, b] = connectionsOf(p.type, p.rot)[0];
+    start = { c: p.c, r: p.r, a, b, t: 0.5 };
+  }
+  train = Object.assign(start, { dir: 1, pause: 0.6, chuff: 0, beat: 0 });
+  sfx.toot();
+}
+
+function removeTrain() {
+  if (!train) return;
+  const [x, y] = worldPoint(train);
+  for (let i = 0; i < 6; i++) puff(x, y, 1.6);
+  train = null;
+}
+
+// How far short of the rear of the train does the track run out? (0 = room for all)
+function rearShortfall(pos) { return travel(clonePos(pos), -TRAIN_LEN); }
+
+// If someone changed the piece under the engine, re-seat the train sensibly.
+function checkTrain() {
+  const p = pieceAt(train.c, train.r);
+  if (!p) { removeTrain(); return false; }
+  if (findExit(p, train.a) === train.b) return true;
+  let ex = findExit(p, train.a);
+  if (ex >= 0) { train.b = ex; return true; }
+  ex = findExit(p, train.b);
+  if (ex >= 0) { train.a = ex; return true; }
+  [train.a, train.b] = connectionsOf(p.type, p.rot)[0];
+  return true;
+}
+
+function reverseTrain() {
+  train.dir = -train.dir;
+  train.pause = 0.9;
+  sfx.toot();
+}
+
+function updateTrain(dt) {
+  if (!train || !checkTrain()) return;
+  if (train.pause > 0) { train.pause -= dt; return; }
+
+  const step = SPEED * dt;
+  if (train.dir > 0) {
+    // Engine first: stop and turn round when the engine reaches an open end.
+    if (travel(train, step) > 0) reverseTrain();
+  } else {
+    // Backing up: turn round when the last carriage reaches an open end.
+    const before = rearShortfall(train);
+    const probe = clonePos(train);
+    const left = travel(probe, -step);
+    if (left > 0 || (before === 0 && rearShortfall(probe) > 0)) reverseTrain();
+    else Object.assign(train, probe);
+  }
+
+  // Choo-choo: a chuff sound and a smoke puff on every beat
+  train.chuff -= dt;
+  if (train.chuff <= 0) {
+    train.chuff = 0.3 / SPEED;
+    train.beat++;
+    sfx.chuff(train.beat % 2 === 0);
+    const e = carPose(train);
+    puff(e.x + Math.cos(e.a) * lay.cell * 0.1, e.y + Math.sin(e.a) * lay.cell * 0.1, 1);
+  }
+}
+
+// Screen position and heading of a car whose centre is at track position `pos`.
+// Uses a front and back "bogie" so cars bend nicely round curves.
+function carPose(pos) {
+  const f = clonePos(pos); travel(f, 0.17);
+  const b = clonePos(pos); travel(b, -0.17);
+  const pf = worldPoint(f), pb = worldPoint(b);
+  return { x: (pf[0] + pb[0]) / 2, y: (pf[1] + pb[1]) / 2,
+           a: Math.atan2(pf[1] - pb[1], pf[0] - pb[0]) };
+}
+
+/* =====================================================================
+   PARTICLES (smoke puffs and placement dust)
+   ===================================================================== */
+function puff(x, y, size) {
+  const s = lay.cell;
+  particles.push({
+    x, y, vx: (Math.random() - 0.5) * s * 0.25, vy: -s * (0.25 + Math.random() * 0.15),
+    life: 1.3, max: 1.3, r0: s * 0.07 * size, r1: s * 0.3 * size, colour: '255,255,255',
+  });
+}
+
+function dust(x, y) {
+  const s = lay.cell;
+  for (let i = 0; i < 7; i++) {
+    const ang = (i / 7) * Math.PI * 2 + Math.random() * 0.5;
+    particles.push({
+      x, y, vx: Math.cos(ang) * s * 1.2, vy: Math.sin(ang) * s * 1.2,
+      life: 0.45, max: 0.45, r0: s * 0.07, r1: s * 0.02, colour: '255,236,179',
+    });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+    p.vx *= 0.97; p.vy *= 0.97;
+  }
+}
+
+/* =====================================================================
+   SOUND (Web Audio, all synthesised - no files)
+   iOS only allows audio after a touch, so the AudioContext is created on
+   the first touch and resumed on later touches if iOS suspended it.
+   ===================================================================== */
+let ac = null, master = null, noiseBuf = null;
+
+function unlockAudio() {
+  try {
+    if (!ac) {
+      // Let sound play even when the iPad's silent switch is on (iOS 17+)
+      if (navigator.audioSession) navigator.audioSession.type = 'playback';
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = 0.8;
+      master.connect(ac.destination);
+      noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+    }
+    if (ac.state !== 'running') ac.resume();
+  } catch (err) { /* no sound is fine */ }
+}
+
+function envelope(g, t, vol, attack, dur) {
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(vol, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+}
+
+function tone(type, f0, f1, dur, vol, delay = 0) {
+  const t = ac.currentTime + delay;
+  const o = ac.createOscillator(), g = ac.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+  envelope(g, t, vol, 0.008, dur);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+
+function noise(dur, freq, q, vol, delay = 0) {
+  const t = ac.currentTime + delay;
+  const s = ac.createBufferSource(), f = ac.createBiquadFilter(), g = ac.createGain();
+  s.buffer = noiseBuf;
+  f.type = 'bandpass'; f.frequency.value = freq; f.Q.value = q;
+  envelope(g, t, vol, 0.006, dur);
+  s.connect(f); f.connect(g); g.connect(master);
+  s.start(t, Math.random() * 0.5); s.stop(t + dur + 0.05);
+}
+
+const sfx = {
+  ok() { return ac && ac.state === 'running'; },
+  // wooden "clack" as a piece snaps into place
+  click()  { if (!this.ok()) return; noise(0.06, 2400, 4, 0.6); tone('triangle', 300, 140, 0.09, 0.4); },
+  rotate() { if (!this.ok()) return; noise(0.05, 3200, 5, 0.4); tone('triangle', 520, 380, 0.06, 0.25); },
+  pick()   { if (!this.ok()) return; tone('sine', 480, 820, 0.09, 0.2); },
+  pop()    { if (!this.ok()) return; tone('sine', 700, 110, 0.2, 0.35); },
+  // steam chuff: a short burst of filtered noise
+  chuff(strong) { if (!this.ok()) return; noise(0.15, strong ? 700 : 900, 0.9, strong ? 0.5 : 0.28); },
+  // two-note whistle: whoo-whoo!
+  toot() {
+    if (!this.ok()) return;
+    for (const [start, dur] of [[0, 0.22], [0.3, 0.45]]) {
+      for (const f of [587, 740]) {
+        const t = ac.currentTime + start;
+        const o = ac.createOscillator(), g = ac.createGain();
+        o.type = 'triangle';
+        o.frequency.setValueAtTime(f * 0.97, t);
+        o.frequency.linearRampToValueAtTime(f, t + 0.06);
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.linearRampToValueAtTime(0.16, t + 0.04);
+        g.gain.setValueAtTime(0.16, t + dur - 0.06);
+        g.gain.linearRampToValueAtTime(0.0001, t + dur);
+        o.connect(g); g.connect(master);
+        o.start(t); o.stop(t + dur + 0.05);
+      }
+    }
+  },
+};
+
+/* =====================================================================
+   LAYOUT
+   Landscape: tray of pieces on the left, buttons on the right.
+   Portrait:  buttons along the top, tray along the bottom.
+   ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const bg = document.createElement('canvas');   // static scenery, redrawn only on resize
+const bgCtx = bg.getContext('2d');
+let scrW = 0, scrH = 0, dpr = 1;
+const lay = {};
+
+function layout() {
+  dpr = Math.min(window.devicePixelRatio || 1, 3);
+  scrW = window.innerWidth; scrH = window.innerHeight;
+  canvas.width = bg.width = Math.round(scrW * dpr);
+  canvas.height = bg.height = Math.round(scrH * dpr);
+
+  const cs = getComputedStyle(document.getElementById('safe'));
+  const st = parseFloat(cs.paddingTop) || 0, sr = parseFloat(cs.paddingRight) || 0;
+  const sb = parseFloat(cs.paddingBottom) || 0, sl = parseFloat(cs.paddingLeft) || 0;
+  const ax = sl, ay = st, aw = scrW - sl - sr, ah = scrH - st - sb;
+
+  const landscape = aw >= ah;
+  const panel = Math.max(100, Math.min(170, Math.min(aw, ah) * 0.19));
+  let tray, btns, area;
+  if (landscape) {
+    tray = { x: ax, y: ay, w: panel, h: ah };
+    btns = { x: ax + aw - panel, y: ay, w: panel, h: ah };
+    area = { x: ax + panel, y: ay, w: aw - 2 * panel, h: ah };
+  } else {
+    btns = { x: ax, y: ay, w: aw, h: panel };
+    tray = { x: ax, y: ay + ah - panel, w: aw, h: panel };
+    area = { x: ax, y: ay + panel, w: aw, h: ah - 2 * panel };
+  }
+
+  const pad = 14;
+  lay.cell = Math.floor(Math.min((area.w - 2 * pad) / COLS, (area.h - 2 * pad) / ROWS));
+  lay.gx = Math.round(area.x + (area.w - lay.cell * COLS) / 2);
+  lay.gy = Math.round(area.y + (area.h - lay.cell * ROWS) / 2);
+  lay.landscape = landscape;
+  lay.tray = tray;
+  lay.btns = btns;
+
+  // Tray slots spread evenly along the tray
+  const len = landscape ? tray.h : tray.w;
+  const slot = Math.min(panel * 0.8, (len / TRAY.length) * 0.8);
+  lay.slots = TRAY.map((type, i) => {
+    const f = (i + 0.5) / TRAY.length;
+    return {
+      type, s: slot,
+      x: landscape ? tray.x + tray.w / 2 : tray.x + tray.w * f,
+      y: landscape ? tray.y + tray.h * f : tray.y + tray.h / 2,
+    };
+  });
+
+  // Go button (big) and bin button
+  lay.go  = { r: panel * 0.4, press: 0 };
+  lay.bin = { r: panel * 0.3, press: 0 };
+  if (landscape) {
+    Object.assign(lay.go,  { x: btns.x + btns.w / 2, y: btns.y + btns.h * 0.32 });
+    Object.assign(lay.bin, { x: btns.x + btns.w / 2, y: btns.y + btns.h * 0.78 });
+  } else {
+    Object.assign(lay.go,  { x: btns.x + btns.w * 0.72, y: btns.y + btns.h / 2 });
+    Object.assign(lay.bin, { x: btns.x + btns.w * 0.25, y: btns.y + btns.h / 2 });
+  }
+
+  drawScenery();
+}
+
+/* =====================================================================
+   DRAWING HELPERS
+   ===================================================================== */
+function rr(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+function circle(g, x, y, r) { g.beginPath(); g.arc(x, y, r, 0, Math.PI * 2); }
+
+function tracePath(g, a, b) {
+  g.beginPath();
+  if (isStraight(a, b)) {
+    g.moveTo(...EDGE_POINT[a]);
+    g.lineTo(...EDGE_POINT[b]);
+  } else {
+    const { cx, cy, a0, d } = curveInfo(a, b);
+    g.arc(cx, cy, 0.5, a0, a0 + d, d < 0);
+  }
+}
+
+// Wooden track is drawn as stacked strokes: outline, wood, groove, wood.
+// The groove stroke peeking out either side of the inner wood gives the two rails.
+const TRACK_LAYERS = [
+  { w: 0.54, c: '#7a4a1f' },
+  { w: 0.48, c: '#f0bf78' },
+  { w: 0.30, c: '#b67b3c' },
+  { w: 0.21, c: '#f3c887' },
+];
+
+// Draw a track piece centred at (x,y), `size` pixels across.
+function drawPiece(g, type, rot, x, y, size, spin = 0, scale = 1, alpha = 1) {
+  const conns = connectionsOf(type, rot);
+  g.save();
+  g.globalAlpha = alpha;
+  g.translate(x, y);
+  g.rotate(spin);
+  g.scale(size * scale, size * scale);
+  g.translate(-0.5, -0.5);
+  g.lineCap = 'butt';
+  // soft shadow
+  g.save();
+  g.translate(0.025, 0.035);
+  g.strokeStyle = 'rgba(0,0,0,0.22)';
+  g.lineWidth = 0.54;
+  for (const [a, b] of conns) { tracePath(g, a, b); g.stroke(); }
+  g.restore();
+  for (const layer of TRACK_LAYERS) {
+    g.strokeStyle = layer.c;
+    g.lineWidth = layer.w;
+    for (const [a, b] of conns) { tracePath(g, a, b); g.stroke(); }
+  }
+  g.restore();
+}
+
+// Top-down engine, drawn in "cell units" facing +x.
+function drawEngine(g) {
+  g.fillStyle = 'rgba(0,0,0,0.25)'; rr(g, -0.25, -0.13, 0.54, 0.32, 0.08); g.fill();
+  g.fillStyle = '#37474f';           rr(g, -0.28, -0.16, 0.56, 0.32, 0.07); g.fill();
+  g.fillStyle = '#e53935';           rr(g, -0.1, -0.13, 0.37, 0.26, 0.13); g.fill();
+  g.fillStyle = '#ef9a9a';           rr(g, -0.08, -0.1, 0.32, 0.06, 0.03); g.fill(); // shine
+  g.fillStyle = '#1e88e5';           rr(g, -0.28, -0.155, 0.21, 0.31, 0.05); g.fill(); // cab
+  g.fillStyle = '#90caf9';           rr(g, -0.25, -0.12, 0.15, 0.24, 0.04); g.fill(); // roof
+  g.fillStyle = '#fdd835';           g.fillRect(-0.02, -0.13, 0.03, 0.26);             // band
+  g.fillStyle = '#212121';           circle(g, 0.12, 0, 0.055); g.fill();              // chimney
+  g.fillStyle = '#555';              circle(g, 0.12, 0, 0.03); g.fill();
+  // friendly eyes looking where it's going
+  for (const ey of [-0.065, 0.065]) {
+    g.fillStyle = '#fff';    circle(g, 0.225, ey, 0.04); g.fill();
+    g.fillStyle = '#212121'; circle(g, 0.24, ey, 0.02); g.fill();
+  }
+}
+
+function drawCarriage(g, colour) {
+  g.fillStyle = 'rgba(0,0,0,0.25)'; rr(g, -0.21, -0.12, 0.46, 0.3, 0.07); g.fill();
+  g.fillStyle = '#5d4037';           rr(g, -0.24, -0.15, 0.48, 0.3, 0.06); g.fill();
+  g.fillStyle = colour;              rr(g, -0.21, -0.12, 0.42, 0.24, 0.05); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.45)'; rr(g, -0.17, -0.09, 0.34, 0.05, 0.025); g.fill();
+}
+
+// Side-view train icon for the Go button (drawn in units of the button radius).
+function drawTrainIcon(g, x, y, r, bgColour) {
+  g.save();
+  g.translate(x, y);
+  g.scale(r, r);
+  g.fillStyle = '#fff';
+  rr(g, -0.58, -0.12, 0.7, 0.38, 0.08); g.fill();   // boiler
+  rr(g, 0.06, -0.45, 0.46, 0.71, 0.06); g.fill();   // cab
+  rr(g, 0.0, -0.53, 0.58, 0.12, 0.05); g.fill();    // roof
+  g.fillRect(-0.48, -0.38, 0.16, 0.3);              // chimney
+  rr(g, -0.54, -0.44, 0.24, 0.09, 0.04); g.fill();  // chimney top
+  g.fillStyle = bgColour;
+  rr(g, 0.16, -0.34, 0.26, 0.2, 0.04); g.fill();    // cab window
+  for (const [wx, wr] of [[-0.38, 0.13], [-0.06, 0.13], [0.32, 0.17]]) {
+    g.fillStyle = '#fff';   circle(g, wx, 0.38, wr); g.fill();
+    g.fillStyle = bgColour; circle(g, wx, 0.38, wr * 0.35); g.fill();
+  }
+  g.restore();
+}
+
+function drawBinIcon(g, x, y, r) {
+  g.save();
+  g.translate(x, y);
+  g.scale(r, r);
+  g.fillStyle = '#fff';
+  g.beginPath();                                    // can
+  g.moveTo(-0.38, -0.25); g.lineTo(0.38, -0.25);
+  g.lineTo(0.3, 0.5); g.lineTo(-0.3, 0.5); g.closePath(); g.fill();
+  rr(g, -0.48, -0.42, 0.96, 0.13, 0.05); g.fill();  // lid
+  rr(g, -0.14, -0.53, 0.28, 0.13, 0.05); g.fill();  // handle
+  g.fillStyle = '#78909c';
+  for (const sx of [-0.15, 0, 0.15]) { rr(g, sx - 0.035, -0.15, 0.07, 0.55, 0.035); g.fill(); }
+  g.restore();
+}
+
+/* =====================================================================
+   SCENERY (static: wooden table, green play mat, tray). Cached in `bg`.
+   ===================================================================== */
+function drawScenery() {
+  const g = bgCtx;
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  // Wooden table: planks with a little grain
+  g.fillStyle = '#d9a066';
+  g.fillRect(0, 0, scrW, scrH);
+  const plank = 70;
+  for (let y = 0; y < scrH; y += plank) {
+    g.fillStyle = (y / plank) % 2 ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)';
+    g.fillRect(0, y, scrW, plank);
+    g.fillStyle = 'rgba(120,70,30,0.35)';
+    g.fillRect(0, y, scrW, 2);
+    g.strokeStyle = 'rgba(150,90,40,0.15)';
+    g.lineWidth = 1.5;
+    for (let k = 1; k < 4; k++) {
+      g.beginPath();
+      const gy = y + k * plank / 4;
+      g.moveTo(0, gy);
+      for (let x = 0; x <= scrW; x += 40) g.lineTo(x, gy + Math.sin(x * 0.01 + y + k) * 3);
+      g.stroke();
+    }
+  }
+
+  // Panels (tray and buttons)
+  for (const p of [lay.tray, lay.btns]) {
+    const m = 10;
+    g.fillStyle = 'rgba(0,0,0,0.2)';
+    rr(g, p.x + m + 3, p.y + m + 5, p.w - 2 * m, p.h - 2 * m, 22); g.fill();
+    g.fillStyle = '#b8743a';
+    rr(g, p.x + m, p.y + m, p.w - 2 * m, p.h - 2 * m, 22); g.fill();
+    g.fillStyle = '#c98648';
+    rr(g, p.x + m + 6, p.y + m + 6, p.w - 2 * m - 12, p.h - 2 * m - 12, 17); g.fill();
+  }
+
+  // Tray slots with their pieces
+  for (const s of lay.slots) {
+    g.fillStyle = '#9c5f2b';
+    rr(g, s.x - s.s / 2, s.y - s.s / 2 + 3, s.s, s.s, 18); g.fill();
+    g.fillStyle = '#fbe9cf';
+    rr(g, s.x - s.s / 2, s.y - s.s / 2, s.s, s.s, 18); g.fill();
+    drawPiece(g, s.type, 0, s.x, s.y, s.s * 0.82);
+  }
+
+  // Green play mat with a soft checkerboard so the squares are easy to see
+  const { gx, gy, cell } = lay;
+  const mw = cell * COLS, mh = cell * ROWS, m = 10;
+  g.fillStyle = 'rgba(0,0,0,0.2)';
+  rr(g, gx - m + 3, gy - m + 6, mw + 2 * m, mh + 2 * m, 20); g.fill();
+  g.fillStyle = '#4e9a35';
+  rr(g, gx - m, gy - m, mw + 2 * m, mh + 2 * m, 20); g.fill();
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      g.fillStyle = (r + c) % 2 ? '#7fcb5c' : '#8ad466';
+      g.fillRect(gx + c * cell, gy + r * cell, cell, cell);
+    }
+  }
+}
+
+/* =====================================================================
+   MAIN DRAW
+   ===================================================================== */
+function drawButton(b, colour, icon) {
+  const s = 1 - 0.12 * b.press;
+  ctx.save();
+  ctx.translate(b.x, b.y);
+  ctx.scale(s, s);
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; circle(ctx, 3, 6, b.r); ctx.fill();
+  ctx.fillStyle = 'rgba(0,0,0,0.25)'; circle(ctx, 0, 0, b.r); ctx.fill();
+  ctx.fillStyle = colour;             circle(ctx, 0, 0, b.r * 0.93); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.18)'; circle(ctx, -b.r * 0.2, -b.r * 0.25, b.r * 0.55); ctx.fill();
+  icon();
+  ctx.restore();
+}
+
+function draw(time) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.drawImage(bg, 0, 0);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const { gx, gy, cell } = lay;
+
+  // Highlight the square a dragged piece would land on
+  if (drag && drag.moved) {
+    const t = cellAt(drag.x, drag.y, true);
+    if (t) {
+      ctx.fillStyle = 'rgba(255,241,118,0.6)';
+      rr(ctx, gx + t.c * cell + 3, gy + t.r * cell + 3, cell - 6, cell - 6, 12); ctx.fill();
+    }
+  }
+
+  // Placed pieces (with rotate and "pop" animations)
+  for (const p of order) {
+    const bounce = 1 + 0.15 * Math.sin(Math.PI * p.pop);
+    drawPiece(ctx, p.type, p.rot, gx + (p.c + 0.5) * cell, gy + (p.r + 0.5) * cell, cell, p.spin, bounce);
+  }
+
+  // Train: carriages trail behind the engine along the track
+  if (train) {
+    const poses = [0, 1, 2].map(i => {
+      const pos = clonePos(train);
+      travel(pos, -GAP * i);
+      return carPose(pos);
+    });
+    ctx.strokeStyle = '#4e342e';
+    ctx.lineWidth = cell * 0.05;
+    ctx.beginPath();
+    ctx.moveTo(poses[0].x, poses[0].y);
+    for (const p of poses) ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+    for (let i = poses.length - 1; i >= 0; i--) {
+      const p = poses[i];
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.a);
+      ctx.scale(cell, cell);
+      if (i === 0) drawEngine(ctx); else drawCarriage(ctx, CAR_COLOURS[i - 1]);
+      ctx.restore();
+    }
+  }
+
+  // Smoke and dust
+  for (const p of particles) {
+    const k = 1 - p.life / p.max;
+    ctx.fillStyle = `rgba(${p.colour},${(p.life / p.max) * 0.85})`;
+    circle(ctx, p.x, p.y, p.r0 + (p.r1 - p.r0) * k);
+    ctx.fill();
+  }
+
+  // Buttons. The Go button glows orange and pulses while the train runs.
+  const running = !!train;
+  const goColour = running ? '#fb8c00' : '#43a047';
+  if (running) {
+    const pulse = (time / 1000) % 1;
+    ctx.strokeStyle = `rgba(255,255,255,${0.6 * (1 - pulse)})`;
+    ctx.lineWidth = 6;
+    circle(ctx, lay.go.x, lay.go.y, lay.go.r * (1 + 0.3 * pulse));
+    ctx.stroke();
+  }
+  drawButton(lay.go, goColour, () => drawTrainIcon(ctx, 0, 0, lay.go.r * 0.62, goColour));
+  // The bin grows a little when you drag a placed piece, inviting you to drop it there
+  const binBig = drag && drag.piece && drag.moved;
+  const binR = lay.bin.r;
+  if (binBig) lay.bin.r = binR * (1.15 + 0.05 * Math.sin(time / 120));
+  drawButton(lay.bin, '#78909c', () => drawBinIcon(ctx, 0, 0, lay.bin.r * 0.62));
+  lay.bin.r = binR;
+
+  // The piece under the finger
+  if (drag && drag.moved) {
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.3)';
+    ctx.shadowBlur = 12;
+    ctx.shadowOffsetY = 8;
+    drawPiece(ctx, drag.type, drag.rot, drag.x, drag.y, cell * 1.05, 0, 1, 0.9);
+    ctx.restore();
+  }
+}
+
+/* =====================================================================
+   TOUCH INPUT (pointer events: one finger at a time)
+   ===================================================================== */
+function hitCircle(b, x, y, slack = 1.15) { return Math.hypot(x - b.x, y - b.y) < b.r * slack; }
+
+// Which grid square is at (x,y)? `forgiving` snaps drops just outside the mat inwards.
+function cellAt(x, y, forgiving) {
+  const { gx, gy, cell } = lay;
+  let c = Math.floor((x - gx) / cell), r = Math.floor((y - gy) / cell);
+  if (forgiving) {
+    const m = cell * 0.5;
+    if (x < gx - m || y < gy - m || x > gx + cell * COLS + m || y > gy + cell * ROWS + m) return null;
+    c = Math.max(0, Math.min(COLS - 1, c));
+    r = Math.max(0, Math.min(ROWS - 1, r));
+  }
+  if (c < 0 || r < 0 || c >= COLS || r >= ROWS) return null;
+  return { c, r };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  unlockAudio();
+  if (drag) return; // ignore extra fingers
+  const x = e.clientX, y = e.clientY;
+
+  if (hitCircle(lay.go, x, y))  { lay.go.press = 1;  train ? removeTrain() : startTrain(); return; }
+  if (hitCircle(lay.bin, x, y)) { lay.bin.press = 1; undo(); return; }
+
+  // Pick up a new piece from the tray
+  for (const s of lay.slots) {
+    if (Math.abs(x - s.x) < s.s * 0.6 && Math.abs(y - s.y) < s.s * 0.6) {
+      drag = { id: e.pointerId, type: s.type, rot: 0, piece: null, x, y, sx: x, sy: y, moved: true };
+      canvas.setPointerCapture(e.pointerId);
+      sfx.pick();
+      return;
+    }
+  }
+
+  // Touch a placed piece: tap to rotate, or drag to move/remove
+  const t = cellAt(x, y, false);
+  const p = t && pieceAt(t.c, t.r);
+  if (p) {
+    if (train && train.c === p.c && train.r === p.r) { sfx.toot(); return; } // tapping the engine toots
+    drag = { id: e.pointerId, type: p.type, rot: p.rot, piece: p, x, y, sx: x, sy: y, moved: false };
+    canvas.setPointerCapture(e.pointerId);
+  }
+});
+
+canvas.addEventListener('pointermove', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  drag.x = e.clientX; drag.y = e.clientY;
+  if (!drag.moved && Math.hypot(drag.x - drag.sx, drag.y - drag.sy) > lay.cell * 0.2) {
+    drag.moved = true;
+    removePiece(drag.piece); // lift it off the board
+    sfx.pick();
+  }
+});
+
+canvas.addEventListener('pointerup', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  const d = drag;
+  drag = null;
+  unlockAudio();
+  if (d.piece && !d.moved) { rotatePiece(d.piece); return; }
+  if (d.piece && hitCircle(lay.bin, d.x, d.y, 1.6)) { sfx.pop(); dust(d.x, d.y); return; }
+  const t = cellAt(d.x, d.y, true);
+  if (t) placePiece(d.type, t.c, t.r, d.rot, true);
+  else if (d.piece) { sfx.pop(); dust(d.x, d.y); } // dragged off the board: gone
+});
+
+canvas.addEventListener('pointercancel', e => {
+  if (!drag || e.pointerId !== drag.id) return;
+  // iOS interrupted the touch: put a lifted piece back where it was
+  if (drag.piece && drag.moved && !pieceAt(drag.piece.c, drag.piece.r)) {
+    grid[drag.piece.r * COLS + drag.piece.c] = drag.piece;
+    order.push(drag.piece);
+  }
+  drag = null;
+});
+
+// Belt and braces against Safari zooming, scrolling, magnifier and menus
+for (const ev of ['gesturestart', 'gesturechange', 'gestureend', 'dblclick', 'contextmenu', 'selectstart']) {
+  document.addEventListener(ev, e => e.preventDefault(), { passive: false });
+}
+document.addEventListener('touchstart', e => e.preventDefault(), { passive: false });
+document.addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+document.addEventListener('touchend', unlockAudio, { passive: true }); // iOS likes touchend for audio
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && ac) ac.suspend();
+});
+
+/* =====================================================================
+   HOME-SCREEN ICON (drawn at start-up: a little loop of track with the engine)
+   ===================================================================== */
+function makeIcon() {
+  const c = document.createElement('canvas');
+  c.width = c.height = 180;
+  const g = c.getContext('2d');
+  g.fillStyle = '#8ad466';
+  g.fillRect(0, 0, 180, 180);
+  const s = 70, o = 20;
+  drawPiece(g, 'curve', 0, o + s * 0.5, o + s * 0.5, s);
+  drawPiece(g, 'curve', 1, o + s * 1.5, o + s * 0.5, s);
+  drawPiece(g, 'curve', 2, o + s * 1.5, o + s * 1.5, s);
+  drawPiece(g, 'curve', 3, o + s * 0.5, o + s * 1.5, s);
+  g.save();
+  g.translate(90, o + s * 0.5);
+  g.scale(s * 1.3, s * 1.3);
+  drawEngine(g);
+  g.restore();
+  const link = document.createElement('link');
+  link.rel = 'apple-touch-icon';
+  link.href = c.toDataURL('image/png');
+  document.head.appendChild(link);
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+let last = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000 || 0);
+  last = now;
+
+  for (const p of order) {
+    p.spin *= Math.max(0, 1 - dt * 14);
+    p.pop = Math.max(0, p.pop - dt * 4);
+  }
+  lay.go.press = Math.max(0, lay.go.press - dt * 6);
+  lay.bin.press = Math.max(0, lay.bin.press - dt * 6);
+  updateTrain(dt);
+  updateParticles(dt);
+  draw(now);
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize', layout);
+window.addEventListener('orientationchange', () => setTimeout(layout, 200));
+layout();
+makeIcon();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
